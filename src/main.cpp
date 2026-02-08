@@ -184,6 +184,7 @@ static bool           g_minimize_to_tray = true;
 static bool           g_device_change_pending = false;
 static DWORD          g_device_change_tick = 0;  /* GetTickCount() when event fired */
 static bool           g_device_removed = false;
+static DWORD          g_usb_cooldown_until = 0;  /* ignore device events until this tick */
 
 static const ImVec4 COL_WARN    = ImVec4(0.902f, 0.706f, 0.157f, 1.0f); /* (230,180,40) */
 
@@ -329,15 +330,25 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         return 0;
 
-    case WM_DEVICECHANGE:
-        if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVNODES_CHANGED) {
+    case WM_DEVICECHANGE: {
+        DWORD now = GetTickCount();
+        if (now < g_usb_cooldown_until)
+            return 0;
+        if (wParam == DBT_DEVICEARRIVAL) {
             g_device_change_pending = true;
-            g_device_change_tick = GetTickCount();
+            g_device_change_tick = now;
+        }
+        if (wParam == DBT_DEVNODES_CHANGED) {
+            if (!g_device_change_pending) {
+                g_device_change_pending = true;
+                g_device_change_tick = now;
+            }
         }
         if (wParam == DBT_DEVICEREMOVECOMPLETE) {
             g_device_removed = true;
         }
         return 0;
+    }
 
     case WM_DESTROY:
         RemoveTrayIcon();
@@ -678,8 +689,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
     /* Initial controller scan + auto-apply saved settings */
     RefreshController();
-    if (g_ctrl.connected)
+    if (g_ctrl.connected) {
         ApplyLed();
+        g_usb_cooldown_until = GetTickCount() + 2000;
+    }
 
     /* Sync autostart checkbox with actual registry state */
     g_start_with_windows = IsAutoStartEnabled();
@@ -698,26 +711,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         }
         if (done) break;
 
-        /* Handle USB device removal - check if our controller is gone */
+        /* Handle USB device removal */
         if (g_device_removed) {
             g_device_removed = false;
             if (g_ctrl.connected) {
-                /* Test if controller is still there by trying a no-op read */
                 xbox_close(&g_ctrl);
-                if (xbox_open(&g_ctrl)) {
-                    /* Still alive, re-apply */
-                } else {
-                    SetStatus("Controller disconnected", COL_DIM);
-                }
+                SetStatus("Controller disconnected", COL_DIM);
+                g_usb_cooldown_until = GetTickCount() + 2000;
+                g_device_change_pending = false;
             }
         }
 
-        /* Handle USB hotplug - try to reconnect after a settle delay */
-        if (g_device_change_pending && (GetTickCount() - g_device_change_tick) >= 500) {
+        /* Handle USB device arrival - only act when not already connected */
+        if (g_device_change_pending && !g_ctrl.connected
+            && (GetTickCount() - g_device_change_tick) >= 1000) {
             g_device_change_pending = false;
-            RefreshController();
+            TryAutoApply();
             if (g_ctrl.connected)
-                ApplyLed();
+                g_usb_cooldown_until = GetTickCount() + 2000;
+        } else if (g_device_change_pending && g_ctrl.connected) {
+            g_device_change_pending = false;
         }
 
         if (g_SwapChainOccluded && g_pSwapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
