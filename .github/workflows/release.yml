@@ -1,0 +1,39 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Package
+        run: |
+          mkdir release
+          copy build\xbledctl.exe release\
+          copy build\libusb-1.0.dll release\
+          7z a xbledctl-${{ github.ref_name }}-win64.zip .\release\*
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: xbledctl-${{ github.ref_name }}-win64.zip
+          generate_release_notes: true
