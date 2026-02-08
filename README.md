@@ -12,6 +12,8 @@ This is the first tool to achieve user-mode LED control on Xbox controllers on W
 - ~400KB executable, no runtime dependencies
 - Works alongside the stock Xbox driver. No Zadig, no driver replacement.
 - Supports Xbox One, One S, One Elite, Elite Series 2, Series X|S, Adaptive Controller
+- Auto-applies saved settings when the controller is plugged in
+- Starts with Windows and minimizes to system tray (configurable)
 
 ## Install
 
@@ -42,6 +44,12 @@ On Linux, the [xone](https://github.com/medusalix/xone) driver sends this native
 [UsbDk](https://github.com/daynix/UsbDk) is a USB filter driver that lets libusb access the device *without replacing the stock driver*. XInput, Steam Input, and everything else continues to work normally.
 
 See [docs/RESEARCH.md](docs/RESEARCH.md) for the full technical writeup of the reverse-engineering process.
+
+## Why does it run in the background?
+
+Xbox controllers don't store LED settings in firmware. Every time the controller is unplugged, powered off, or reconnected, the LED resets to its default brightness. There's no way around this at the hardware level.
+
+To keep your preferred brightness without having to re-apply it manually every time, xbledctl can start with Windows and sit in the system tray. When it detects a controller being plugged in, it automatically re-applies your saved LED settings. Both options are enabled by default and can be toggled in the app.
 
 ## Supported Controllers
 

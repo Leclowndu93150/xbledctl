@@ -12,7 +12,12 @@
 
 #include <d3d11.h>
 #include <shellapi.h>
+#include <shlwapi.h>
+#include <dbt.h>
 #include <cstdio>
+#include <cstring>
+
+#pragma comment(lib, "shlwapi.lib")
 
 extern "C" {
 #include "xbox_led.h"
@@ -35,24 +40,133 @@ static void CreateRenderTarget();
 static void CleanupRenderTarget();
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
-static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+/* ------------------------------------------------------------------ */
+/* Config file (settings persistence)                                  */
+/* ------------------------------------------------------------------ */
+
+static char g_config_path[MAX_PATH] = {};
+
+static void InitConfigPath()
 {
-    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-        return true;
-    switch (msg) {
-    case WM_SIZE:
-        if (wParam == SIZE_MINIMIZED) return 0;
-        g_ResizeWidth  = (UINT)LOWORD(lParam);
-        g_ResizeHeight = (UINT)HIWORD(lParam);
-        return 0;
-    case WM_SYSCOMMAND:
-        if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
-        break;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
+    GetModuleFileNameA(nullptr, g_config_path, MAX_PATH);
+    PathRemoveFileSpecA(g_config_path);
+    strcat_s(g_config_path, "\\xbledctl.ini");
+}
+
+static void SaveConfig(int brightness, int mode_idx, bool start_with_windows, bool minimize_to_tray)
+{
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "[xbledctl]\nbrightness=%d\nmode=%d\nstart_with_windows=%d\nminimize_to_tray=%d\n",
+        brightness, mode_idx, start_with_windows ? 1 : 0, minimize_to_tray ? 1 : 0);
+    FILE *f = nullptr;
+    fopen_s(&f, g_config_path, "w");
+    if (f) { fputs(buf, f); fclose(f); }
+}
+
+static void LoadConfig(int *brightness, int *mode_idx, bool *start_with_windows, bool *minimize_to_tray)
+{
+    *brightness = LED_BRIGHTNESS_DEFAULT;
+    *mode_idx = 1;
+    *start_with_windows = true;
+    *minimize_to_tray = true;
+
+    FILE *f = nullptr;
+    fopen_s(&f, g_config_path, "r");
+    if (!f) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        int val;
+        if (sscanf_s(line, "brightness=%d", &val) == 1)
+            *brightness = (val >= 0 && val <= LED_BRIGHTNESS_MAX) ? val : LED_BRIGHTNESS_DEFAULT;
+        else if (sscanf_s(line, "mode=%d", &val) == 1)
+            *mode_idx = (val >= 0 && val <= 6) ? val : 1;
+        else if (sscanf_s(line, "start_with_windows=%d", &val) == 1)
+            *start_with_windows = (val != 0);
+        else if (sscanf_s(line, "minimize_to_tray=%d", &val) == 1)
+            *minimize_to_tray = (val != 0);
     }
-    return DefWindowProcW(hWnd, msg, wParam, lParam);
+    fclose(f);
+}
+
+/* ------------------------------------------------------------------ */
+/* Auto-start with Windows (registry)                                  */
+/* ------------------------------------------------------------------ */
+
+static const char *AUTOSTART_KEY = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const char *AUTOSTART_VAL = "xbledctl";
+
+static void SetAutoStart(bool enable)
+{
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, AUTOSTART_KEY, 0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS)
+        return;
+
+    if (enable) {
+        char exe_path[MAX_PATH];
+        GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+        /* Add --minimized flag so it starts in tray */
+        char cmd[MAX_PATH + 32];
+        snprintf(cmd, sizeof(cmd), "\"%s\" --minimized", exe_path);
+        RegSetValueExA(hKey, AUTOSTART_VAL, 0, REG_SZ, (BYTE *)cmd, (DWORD)strlen(cmd) + 1);
+    } else {
+        RegDeleteValueA(hKey, AUTOSTART_VAL);
+    }
+    RegCloseKey(hKey);
+}
+
+static bool IsAutoStartEnabled()
+{
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, AUTOSTART_KEY, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
+    DWORD type, size = 0;
+    bool exists = RegQueryValueExA(hKey, AUTOSTART_VAL, nullptr, &type, nullptr, &size) == ERROR_SUCCESS;
+    RegCloseKey(hKey);
+    return exists;
+}
+
+/* ------------------------------------------------------------------ */
+/* System tray                                                         */
+/* ------------------------------------------------------------------ */
+
+#define WM_TRAYICON (WM_USER + 1)
+#define ID_TRAY_SHOW 1001
+#define ID_TRAY_QUIT 1002
+
+static NOTIFYICONDATAW g_nid = {};
+static HWND g_hwnd = nullptr;
+static bool g_minimized_to_tray = false;
+
+static void AddTrayIcon(HWND hwnd)
+{
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wcscpy_s(g_nid.szTip, L"Xbox LED Control");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+}
+
+static void RemoveTrayIcon()
+{
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+}
+
+static void MinimizeToTray(HWND hwnd)
+{
+    ShowWindow(hwnd, SW_HIDE);
+    g_minimized_to_tray = true;
+}
+
+static void RestoreFromTray(HWND hwnd)
+{
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    g_minimized_to_tray = false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -65,7 +179,13 @@ static int            g_mode_idx   = 1; /* Steady */
 static char           g_status[128] = "Plug in your controller with a USB cable";
 static ImVec4         g_status_color;
 static bool           g_need_usbdk = false;
-static const ImVec4   COL_WARN = ImVec4(0.902f, 0.706f, 0.157f, 1.0f); /* (230,180,40) */
+static bool           g_start_with_windows = true;
+static bool           g_minimize_to_tray = true;
+static bool           g_device_change_pending = false;
+static DWORD          g_device_change_tick = 0;  /* GetTickCount() when event fired */
+static bool           g_device_removed = false;
+
+static const ImVec4 COL_WARN    = ImVec4(0.902f, 0.706f, 0.157f, 1.0f); /* (230,180,40) */
 
 struct ModeEntry {
     const char *label;
@@ -84,13 +204,13 @@ static const ModeEntry MODES[] = {
 static const int MODE_COUNT = sizeof(MODES) / sizeof(MODES[0]);
 
 /* Colors */
-static const ImVec4 COL_SUCCESS  = ImVec4(0.157f, 0.784f, 0.314f, 1.0f); /* (40,200,80)   */
-static const ImVec4 COL_ERROR    = ImVec4(0.863f, 0.235f, 0.235f, 1.0f); /* (220,60,60)   */
-static const ImVec4 COL_DIM      = ImVec4(0.549f, 0.549f, 0.588f, 1.0f); /* (140,140,150) */
-static const ImVec4 COL_TEXT     = ImVec4(0.902f, 0.902f, 0.922f, 1.0f); /* (230,230,235) */
-static const ImVec4 COL_ACCENT   = ImVec4(0.063f, 0.486f, 0.063f, 1.0f); /* (16,124,16)   */
-static const ImVec4 COL_ACCENT_H = ImVec4(0.078f, 0.627f, 0.078f, 1.0f); /* (20,160,20)   */
-static const ImVec4 COL_ACCENT_A = ImVec4(0.047f, 0.392f, 0.047f, 1.0f); /* (12,100,12)   */
+static const ImVec4 COL_SUCCESS  = ImVec4(0.157f, 0.784f, 0.314f, 1.0f);
+static const ImVec4 COL_ERROR    = ImVec4(0.863f, 0.235f, 0.235f, 1.0f);
+static const ImVec4 COL_DIM      = ImVec4(0.549f, 0.549f, 0.588f, 1.0f);
+static const ImVec4 COL_TEXT     = ImVec4(0.902f, 0.902f, 0.922f, 1.0f);
+static const ImVec4 COL_ACCENT   = ImVec4(0.063f, 0.486f, 0.063f, 1.0f);
+static const ImVec4 COL_ACCENT_H = ImVec4(0.078f, 0.627f, 0.078f, 1.0f);
+static const ImVec4 COL_ACCENT_A = ImVec4(0.047f, 0.392f, 0.047f, 1.0f);
 
 static void SetStatus(const char *msg, const ImVec4 &col)
 {
@@ -123,6 +243,7 @@ static void ApplyLed()
                      MODES[g_mode_idx].label, bright, LED_BRIGHTNESS_MAX);
             SetStatus(buf, COL_SUCCESS);
         }
+        SaveConfig(g_brightness, g_mode_idx, g_start_with_windows, g_minimize_to_tray);
     } else {
         xbox_close(&g_ctrl);
         SetStatus("Command failed - try Refresh to reconnect", COL_ERROR);
@@ -141,6 +262,89 @@ static void RefreshController()
     } else {
         SetStatus("Plug in your controller with a USB cable", COL_DIM);
     }
+}
+
+/* Try to connect and auto-apply saved settings */
+static void TryAutoApply()
+{
+    if (g_ctrl.connected)
+        return;
+    xbox_close(&g_ctrl);
+    if (xbox_open(&g_ctrl)) {
+        SetStatus("Controller connected - applying saved settings", COL_SUCCESS);
+        ApplyLed();
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* WndProc                                                             */
+/* ------------------------------------------------------------------ */
+
+static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return true;
+
+    switch (msg) {
+    case WM_SIZE:
+        if (wParam == SIZE_MINIMIZED) {
+            if (g_minimize_to_tray) {
+                MinimizeToTray(hWnd);
+                return 0;
+            }
+        }
+        g_ResizeWidth  = (UINT)LOWORD(lParam);
+        g_ResizeHeight = (UINT)HIWORD(lParam);
+        return 0;
+
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
+        /* Intercept close to minimize to tray instead */
+        if ((wParam & 0xfff0) == SC_CLOSE && g_minimize_to_tray) {
+            MinimizeToTray(hWnd);
+            return 0;
+        }
+        break;
+
+    case WM_TRAYICON:
+        if (lParam == WM_LBUTTONDBLCLK) {
+            RestoreFromTray(hWnd);
+        } else if (lParam == WM_RBUTTONUP) {
+            POINT pt;
+            GetCursorPos(&pt);
+            HMENU menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, ID_TRAY_SHOW, L"Show");
+            AppendMenuW(menu, MF_STRING, ID_TRAY_QUIT, L"Quit");
+            SetForegroundWindow(hWnd);
+            TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
+            DestroyMenu(menu);
+        }
+        return 0;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == ID_TRAY_SHOW) RestoreFromTray(hWnd);
+        if (LOWORD(wParam) == ID_TRAY_QUIT) {
+            RemoveTrayIcon();
+            DestroyWindow(hWnd);
+        }
+        return 0;
+
+    case WM_DEVICECHANGE:
+        if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVNODES_CHANGED) {
+            g_device_change_pending = true;
+            g_device_change_tick = GetTickCount();
+        }
+        if (wParam == DBT_DEVICEREMOVECOMPLETE) {
+            g_device_removed = true;
+        }
+        return 0;
+
+    case WM_DESTROY:
+        RemoveTrayIcon();
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
 /* ------------------------------------------------------------------ */
@@ -240,7 +444,7 @@ static void RenderGui(ImFont *fontTitle, ImFont *fontSub, ImFont *fontBig)
         /* Slider */
         ImGui::SetNextItemWidth(-1);
         if (ImGui::SliderInt("##brightness", &g_brightness, 0, LED_BRIGHTNESS_MAX, "", ImGuiSliderFlags_None)) {
-            /* Value changed while dragging - nothing to do */
+            /* Value changed while dragging */
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             ApplyLed();
@@ -285,7 +489,6 @@ static void RenderGui(ImFont *fontTitle, ImFont *fontSub, ImFont *fontBig)
     ImGui::EndChild();
 
     ImGui::Spacing();
-    ImGui::Spacing();
 
     /* ---- Bottom bar ---- */
     /* Apply button */
@@ -314,11 +517,25 @@ static void RenderGui(ImFont *fontTitle, ImFont *fontSub, ImFont *fontBig)
     ImGui::Spacing();
     ImGui::TextColored(g_status_color, "%s", g_status);
 
+    /* ---- Settings ---- */
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (ImGui::Checkbox("Start with Windows", &g_start_with_windows)) {
+        SetAutoStart(g_start_with_windows);
+        SaveConfig(g_brightness, g_mode_idx, g_start_with_windows, g_minimize_to_tray);
+    }
+    ImGui::SameLine(0, 20);
+    if (ImGui::Checkbox("Minimize to tray", &g_minimize_to_tray)) {
+        SaveConfig(g_brightness, g_mode_idx, g_start_with_windows, g_minimize_to_tray);
+    }
+
     ImGui::End();
 }
 
 /* ------------------------------------------------------------------ */
-/* D3D11 helpers (from Dear ImGui example)                             */
+/* D3D11 helpers                                                       */
 /* ------------------------------------------------------------------ */
 
 static bool CreateDeviceD3D(HWND hWnd)
@@ -373,14 +590,21 @@ static void CleanupRenderTarget()
 /* Entry point                                                         */
 /* ------------------------------------------------------------------ */
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 {
+    /* Check if launched with --minimized (auto-start) */
+    bool start_minimized = (strstr(lpCmdLine, "--minimized") != nullptr);
+
     /* Init controller */
     xbox_init(&g_ctrl);
     g_status_color = COL_DIM;
 
-    /* Early UsbDk check - show native dialog before the GUI even loads */
-    if (!xbox_is_usbdk_installed()) {
+    /* Load saved settings */
+    InitConfigPath();
+    LoadConfig(&g_brightness, &g_mode_idx, &g_start_with_windows, &g_minimize_to_tray);
+
+    /* Early UsbDk check */
+    if (!xbox_is_usbdk_installed() && !start_minimized) {
         int choice = MessageBoxW(nullptr,
             L"UsbDk USB filter driver is not installed.\n\n"
             L"xbledctl requires UsbDk to communicate with Xbox controllers.\n"
@@ -399,35 +623,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         nullptr, nullptr, nullptr, nullptr, L"xbledctl", nullptr };
     RegisterClassExW(&wc);
 
-    /* Calculate window rect for 520x530 client area */
-    RECT wr = { 0, 0, 520, 530 };
+    RECT wr = { 0, 0, 520, 580 };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&wr, style, FALSE);
 
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Xbox LED Control",
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Xbox LED Control",
         style, CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
         nullptr, nullptr, hInstance, nullptr);
 
-    if (!CreateDeviceD3D(hwnd)) {
+    if (!CreateDeviceD3D(g_hwnd)) {
         CleanupDeviceD3D();
         UnregisterClassW(wc.lpszClassName, hInstance);
         return 1;
     }
 
-    ShowWindow(hwnd, SW_SHOWDEFAULT);
-    UpdateWindow(hwnd);
+    /* Register for USB device notifications */
+    DEV_BROADCAST_DEVICEINTERFACE dbdi = {};
+    dbdi.dbcc_size = sizeof(dbdi);
+    dbdi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+    RegisterDeviceNotification(g_hwnd, &dbdi, DEVICE_NOTIFY_WINDOW_HANDLE | DEVICE_NOTIFY_ALL_INTERFACE_CLASSES);
+
+    /* System tray icon */
+    AddTrayIcon(g_hwnd);
+
+    if (start_minimized) {
+        MinimizeToTray(g_hwnd);
+    } else {
+        ShowWindow(g_hwnd, SW_SHOWDEFAULT);
+        UpdateWindow(g_hwnd);
+    }
 
     /* ImGui setup */
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    io.IniFilename = nullptr; /* no imgui.ini */
+    io.IniFilename = nullptr;
 
     ApplyXboxTheme();
 
-    ImGui_ImplWin32_Init(hwnd);
+    ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
     /* Load fonts */
@@ -440,10 +676,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     if (!fontSub)     fontSub     = fontDefault;
     if (!fontBig)     fontBig     = fontDefault;
 
-    /* Initial controller scan */
+    /* Initial controller scan + auto-apply saved settings */
     RefreshController();
+    if (g_ctrl.connected)
+        ApplyLed();
 
-    /* Clear color (dark background) */
+    /* Sync autostart checkbox with actual registry state */
+    g_start_with_windows = IsAutoStartEnabled();
+
     const float clear[4] = { 0.071f, 0.071f, 0.094f, 1.0f };
 
     /* Main loop */
@@ -457,6 +697,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
                 done = true;
         }
         if (done) break;
+
+        /* Handle USB device removal - check if our controller is gone */
+        if (g_device_removed) {
+            g_device_removed = false;
+            if (g_ctrl.connected) {
+                /* Test if controller is still there by trying a no-op read */
+                xbox_close(&g_ctrl);
+                if (xbox_open(&g_ctrl)) {
+                    /* Still alive, re-apply */
+                } else {
+                    SetStatus("Controller disconnected", COL_DIM);
+                }
+            }
+        }
+
+        /* Handle USB hotplug - try to reconnect after a settle delay */
+        if (g_device_change_pending && (GetTickCount() - g_device_change_tick) >= 500) {
+            g_device_change_pending = false;
+            RefreshController();
+            if (g_ctrl.connected)
+                ApplyLed();
+        }
 
         if (g_SwapChainOccluded && g_pSwapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
             Sleep(10);
@@ -484,7 +746,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        HRESULT hr = g_pSwapChain->Present(1, 0); /* vsync */
+        HRESULT hr = g_pSwapChain->Present(1, 0);
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
     }
 
@@ -495,7 +757,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     CleanupDeviceD3D();
-    DestroyWindow(hwnd);
+    DestroyWindow(g_hwnd);
     UnregisterClassW(wc.lpszClassName, hInstance);
 
     return 0;
