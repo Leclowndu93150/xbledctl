@@ -114,6 +114,7 @@ static bool IsAutoStartEnabled()
 static NOTIFYICONDATAW g_nid = {};
 static HWND g_hwnd = nullptr;
 static bool g_minimized_to_tray = false;
+static int  g_redraw_frames = 3;
 
 static void AddTrayIcon(HWND hwnd)
 {
@@ -143,6 +144,7 @@ static void RestoreFromTray(HWND hwnd)
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
     g_minimized_to_tray = false;
+    g_redraw_frames = 3;
 }
 
 static XboxController g_ctrl;
@@ -188,6 +190,7 @@ static void SetStatus(const char *msg, const ImVec4 &col)
 {
     snprintf(g_status, sizeof(g_status), "%s", msg);
     g_status_color = col;
+    g_redraw_frames = 3;
 }
 
 static void ApplyLed()
@@ -254,6 +257,16 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return true;
 
     switch (msg) {
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_MOUSEWHEEL:
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+    case WM_CHAR:
+    case WM_PAINT:
+        g_redraw_frames = 3;
+        break;
     case WM_SIZE:
         if (wParam == SIZE_MINIMIZED) {
             if (g_minimize_to_tray) {
@@ -470,7 +483,7 @@ static bool CreateDeviceD3D(HWND hWnd)
     sd.OutputWindow = hWnd;
     sd.SampleDesc.Count = 1;
     sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     D3D_FEATURE_LEVEL featureLevel;
     const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
@@ -552,7 +565,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr;
 
     ApplyXboxTheme();
@@ -563,11 +575,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     ImFont *fontDefault = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
     ImFont *fontTitle   = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 28.0f);
     ImFont *fontSub     = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 14.0f);
-    ImFont *fontBig     = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 42.0f);
+    ImFont *fontBig     = fontTitle;
     if (!fontDefault) fontDefault = io.Fonts->AddFontDefault();
     if (!fontTitle)   fontTitle   = fontDefault;
     if (!fontSub)     fontSub     = fontDefault;
-    if (!fontBig)     fontBig     = fontDefault;
+    fontBig = fontTitle;
 
     RefreshController();
     if (g_controller_present)
@@ -579,6 +591,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
     bool done = false;
     while (!done) {
+        if (g_minimized_to_tray && !g_device_change_pending && !g_device_removed) {
+            WaitMessage();
+        } else if (g_redraw_frames <= 0 && !g_device_change_pending && !g_device_removed) {
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
+        }
+
         MSG msg;
         while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
             TranslateMessage(&msg);
@@ -606,8 +624,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             g_device_change_pending = false;
         }
 
+        if (g_minimized_to_tray)
+            continue;
+
         if (g_SwapChainOccluded && g_pSwapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
-            Sleep(10);
+            Sleep(100);
             continue;
         }
         g_SwapChainOccluded = false;
@@ -617,7 +638,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
             g_ResizeWidth = g_ResizeHeight = 0;
             CreateRenderTarget();
+            g_redraw_frames = 3;
         }
+
+        if (g_redraw_frames <= 0)
+            continue;
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -634,6 +659,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
         HRESULT hr = g_pSwapChain->Present(1, 0);
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
+        g_redraw_frames--;
     }
 
     xbox_cleanup(&g_ctrl);
