@@ -1,215 +1,113 @@
-/*
- * Xbox controller LED control via libusb + UsbDk.
- *
- * Bypasses the Windows xboxgip/dc1-controller driver stack by using
- * UsbDk as a USB filter driver, giving libusb direct access to the
- * bulk/interrupt OUT endpoint for sending GIP LED commands.
- */
-
 #include "xbox_led.h"
-#include "libusb.h"
 
 #include <stdio.h>
 #include <string.h>
 
-#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#endif
 
-/* Supported Xbox controller USB Product IDs */
-static const struct { uint16_t pid; const char *name; } XBOX_DEVICES[] = {
-    { 0x02D1, "Xbox One Controller (1537)"       },
-    { 0x02DD, "Xbox One Controller (1697)"       },
-    { 0x02E3, "Xbox One Elite Controller"        },
-    { 0x02EA, "Xbox One S Controller"            },
-    { 0x0B00, "Xbox One Elite Series 2"          },
-    { 0x0B05, "Xbox One Elite Series 2 v2"       },
-    { 0x0B12, "Xbox Series X|S Controller"       },
-    { 0x0B20, "Xbox Adaptive Controller"         },
-};
-#define XBOX_DEVICE_COUNT (sizeof(XBOX_DEVICES) / sizeof(XBOX_DEVICES[0]))
+#define GIP_REENUMERATE 0x40001CD0
 
-static const char *find_device_name(uint16_t pid)
-{
-    for (int i = 0; i < (int)XBOX_DEVICE_COUNT; i++)
-        if (XBOX_DEVICES[i].pid == pid)
-            return XBOX_DEVICES[i].name;
-    return "Unknown Xbox Controller";
-}
-
-static bool is_xbox_pid(uint16_t pid)
-{
-    for (int i = 0; i < (int)XBOX_DEVICE_COUNT; i++)
-        if (XBOX_DEVICES[i].pid == pid)
-            return true;
-    return false;
-}
-
-/* ------------------------------------------------------------------ */
-/* Lifecycle                                                           */
-/* ------------------------------------------------------------------ */
+#pragma pack(push, 1)
+typedef struct {
+    uint64_t deviceId;
+    uint8_t  commandId;
+    uint8_t  clientFlags;
+    uint8_t  sequence;
+    uint8_t  unknown1;
+    uint32_t length;
+    uint32_t unknown2;
+} GipHeader;
+#pragma pack(pop)
 
 void xbox_init(XboxController *ctrl)
 {
     memset(ctrl, 0, sizeof(*ctrl));
-    ctrl->claimed_iface = -1;
     ctrl->seq = 1;
+}
+
+static bool discover_device(XboxController *ctrl)
+{
+    HANDLE h = (HANDLE)ctrl->handle;
+    DWORD bytes = 0;
+    DeviceIoControl(h, GIP_REENUMERATE, NULL, 0, NULL, 0, &bytes, NULL);
+
+    uint8_t buf[4096];
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof(ov));
+    ov.hEvent = (HANDLE)ctrl->read_event;
+
+    for (int i = 0; i < 20; i++) {
+        memset(buf, 0, sizeof(buf));
+        ResetEvent(ov.hEvent);
+        DWORD rd = 0;
+        BOOL ok = ReadFile(h, buf, sizeof(buf), &rd, &ov);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            DWORD wait = WaitForSingleObject(ov.hEvent, 500);
+            if (wait == WAIT_TIMEOUT) {
+                CancelIo(h);
+                WaitForSingleObject(ov.hEvent, 100);
+                continue;
+            }
+            GetOverlappedResult(h, &ov, &rd, FALSE);
+        }
+        if (rd < sizeof(GipHeader))
+            continue;
+
+        GipHeader *hdr = (GipHeader *)buf;
+        if (hdr->commandId == 0x01 || hdr->commandId == 0x02) {
+            ctrl->device_id = hdr->deviceId;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool xbox_open(XboxController *ctrl)
 {
     xbox_close(ctrl);
 
-    /* Init libusb */
-    libusb_context *ctx = NULL;
-    int rc = libusb_init(&ctx);
-    if (rc != 0) {
+    HANDLE h = CreateFileW(L"\\\\.\\XboxGIP",
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+        NULL);
+
+    if (h == INVALID_HANDLE_VALUE) {
         snprintf(ctrl->error, sizeof(ctrl->error),
-                 "libusb_init failed: %s", libusb_strerror(rc));
-        ctrl->last_err = XBOX_ERR_LIBUSB;
+                 "Cannot open XboxGIP driver (error %lu)", GetLastError());
+        ctrl->last_err = XBOX_ERR_OPEN_FAILED;
         return false;
     }
-    ctrl->ctx = ctx;
+    ctrl->handle = h;
+    ctrl->read_event = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-    /* Enable UsbDk backend */
-    rc = libusb_set_option(ctx, LIBUSB_OPTION_USE_USBDK);
-    if (rc != 0 && !xbox_is_usbdk_installed()) {
-        snprintf(ctrl->error, sizeof(ctrl->error),
-                 "UsbDk is not installed");
-        ctrl->last_err = XBOX_ERR_NO_USBDK;
-        xbox_close(ctrl);
-        return false;
-    }
-
-    /* Enumerate USB devices */
-    libusb_device **dev_list = NULL;
-    ssize_t count = libusb_get_device_list(ctx, &dev_list);
-    if (count < 0) {
-        snprintf(ctrl->error, sizeof(ctrl->error),
-                 "libusb_get_device_list failed: %s", libusb_strerror((int)count));
-        xbox_close(ctrl);
-        return false;
-    }
-    ctrl->dev_list = (void **)dev_list;
-
-    /* Find an Xbox controller */
-    libusb_device *target = NULL;
-    for (ssize_t i = 0; i < count; i++) {
-        struct libusb_device_descriptor desc;
-        libusb_get_device_descriptor(dev_list[i], &desc);
-        if (desc.idVendor == XBOX_VID && is_xbox_pid(desc.idProduct)) {
-            target = dev_list[i];
-            ctrl->vid = desc.idVendor;
-            ctrl->pid = desc.idProduct;
-            snprintf(ctrl->name, sizeof(ctrl->name), "%s", find_device_name(desc.idProduct));
-            break;
-        }
-    }
-
-    if (!target) {
+    if (!discover_device(ctrl)) {
         snprintf(ctrl->error, sizeof(ctrl->error), "No Xbox controller found");
         ctrl->last_err = XBOX_ERR_NO_DEVICE;
+        xbox_close(ctrl);
         return false;
     }
 
-    /* Discover OUT endpoints from config descriptor */
-    struct {
-        int iface;
-        uint8_t addr;
-        int is_int;
-    } out_eps[16];
-    int out_ep_count = 0;
-
-    struct libusb_config_descriptor *cfg = NULL;
-    if (libusb_get_config_descriptor(target, 0, &cfg) == 0) {
-        for (int i = 0; i < cfg->bNumInterfaces; i++) {
-            const struct libusb_interface *iface = &cfg->interface[i];
-            for (int j = 0; j < iface->num_altsetting; j++) {
-                const struct libusb_interface_descriptor *alt = &iface->altsetting[j];
-                for (int k = 0; k < alt->bNumEndpoints; k++) {
-                    const struct libusb_endpoint_descriptor *ep = &alt->endpoint[k];
-                    if (!(ep->bEndpointAddress & 0x80) && out_ep_count < 16) {
-                        out_eps[out_ep_count].iface = alt->bInterfaceNumber;
-                        out_eps[out_ep_count].addr = ep->bEndpointAddress;
-                        out_eps[out_ep_count].is_int = (ep->bmAttributes & 3) == 3;
-                        out_ep_count++;
-                    }
-                }
-            }
-        }
-        libusb_free_config_descriptor(cfg);
-    }
-
-    /* Open device */
-    libusb_device_handle *handle = NULL;
-    rc = libusb_open(target, &handle);
-    if (rc != 0) {
-        if (rc == LIBUSB_ERROR_NOT_SUPPORTED || rc == LIBUSB_ERROR_ACCESS) {
-            snprintf(ctrl->error, sizeof(ctrl->error),
-                     "UsbDk is not installed or needs a reboot");
-            ctrl->last_err = XBOX_ERR_NO_USBDK;
-        } else {
-            snprintf(ctrl->error, sizeof(ctrl->error),
-                     "libusb_open failed: %s", libusb_strerror(rc));
-            ctrl->last_err = XBOX_ERR_OPEN_FAILED;
-        }
-        return false;
-    }
-    ctrl->handle = handle;
-
-    libusb_set_auto_detach_kernel_driver(handle, 1);
-
-    /* Claim the first interface with an OUT endpoint */
-    for (int i = 0; i < out_ep_count; i++) {
-        rc = libusb_claim_interface(handle, out_eps[i].iface);
-        if (rc != 0) {
-            libusb_detach_kernel_driver(handle, out_eps[i].iface);
-            rc = libusb_claim_interface(handle, out_eps[i].iface);
-        }
-        if (rc == 0) {
-            ctrl->claimed_iface = out_eps[i].iface;
-            ctrl->out_ep = out_eps[i].addr;
-            ctrl->out_ep_is_int = out_eps[i].is_int;
-            ctrl->connected = true;
-            ctrl->last_err = XBOX_OK;
-            ctrl->error[0] = '\0';
-            return true;
-        }
-    }
-
-    snprintf(ctrl->error, sizeof(ctrl->error),
-             "Could not claim any USB interface");
-    ctrl->last_err = XBOX_ERR_CLAIM;
-    xbox_close(ctrl);
-    return false;
+    ctrl->connected = true;
+    ctrl->last_err = XBOX_OK;
+    ctrl->error[0] = '\0';
+    return true;
 }
 
 void xbox_close(XboxController *ctrl)
 {
-    libusb_device_handle *handle = (libusb_device_handle *)ctrl->handle;
-
-    if (handle) {
-        if (ctrl->claimed_iface >= 0) {
-            libusb_release_interface(handle, ctrl->claimed_iface);
-            ctrl->claimed_iface = -1;
-        }
-        libusb_close(handle);
+    if (ctrl->read_event) {
+        CloseHandle((HANDLE)ctrl->read_event);
+        ctrl->read_event = NULL;
+    }
+    if (ctrl->handle) {
+        CloseHandle((HANDLE)ctrl->handle);
         ctrl->handle = NULL;
     }
-
-    ctrl->out_ep = 0;
+    ctrl->device_id = 0;
     ctrl->connected = false;
-
-    if (ctrl->dev_list) {
-        libusb_free_device_list((libusb_device **)ctrl->dev_list, 1);
-        ctrl->dev_list = NULL;
-    }
-
-    if (ctrl->ctx) {
-        libusb_exit((libusb_context *)ctrl->ctx);
-        ctrl->ctx = NULL;
-    }
 }
 
 void xbox_cleanup(XboxController *ctrl)
@@ -217,58 +115,48 @@ void xbox_cleanup(XboxController *ctrl)
     xbox_close(ctrl);
 }
 
-/* ------------------------------------------------------------------ */
-/* GIP transport                                                       */
-/* ------------------------------------------------------------------ */
-
-static bool send_gip(XboxController *ctrl, uint8_t cmd, uint8_t flags,
-                     const uint8_t *payload, int payload_len)
+bool xbox_set_led(XboxController *ctrl, uint8_t mode, uint8_t brightness)
 {
     if (!ctrl->connected || !ctrl->handle)
         return false;
 
-    uint8_t packet[64];
-    int pkt_len = 4 + payload_len;
-    if (pkt_len > (int)sizeof(packet))
-        return false;
+    if (brightness > LED_BRIGHTNESS_MAX)
+        brightness = LED_BRIGHTNESS_MAX;
 
-    packet[0] = cmd;
-    packet[1] = flags;
-    packet[2] = ctrl->seq;
-    packet[3] = (uint8_t)payload_len;
-    memcpy(packet + 4, payload, payload_len);
+    uint8_t payload[] = { 0x00, mode, brightness };
+    uint8_t pkt[sizeof(GipHeader) + sizeof(payload)];
+    memset(pkt, 0, sizeof(pkt));
+
+    GipHeader *hdr = (GipHeader *)pkt;
+    hdr->deviceId = ctrl->device_id;
+    hdr->commandId = GIP_CMD_LED;
+    hdr->clientFlags = GIP_OPT_INTERNAL;
+    hdr->sequence = ctrl->seq;
+    hdr->length = sizeof(payload);
+    memcpy(pkt + sizeof(GipHeader), payload, sizeof(payload));
 
     ctrl->seq = (ctrl->seq % 255) + 1;
 
-    int transferred = 0;
-    int rc;
-    libusb_device_handle *handle = (libusb_device_handle *)ctrl->handle;
+    DWORD written = 0;
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof(ov));
+    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-    if (ctrl->out_ep_is_int)
-        rc = libusb_interrupt_transfer(handle, ctrl->out_ep, packet, pkt_len, &transferred, 3000);
-    else
-        rc = libusb_bulk_transfer(handle, ctrl->out_ep, packet, pkt_len, &transferred, 3000);
+    BOOL ok = WriteFile((HANDLE)ctrl->handle, pkt, sizeof(pkt), &written, &ov);
+    if (!ok && GetLastError() == ERROR_IO_PENDING) {
+        WaitForSingleObject(ov.hEvent, 2000);
+        GetOverlappedResult((HANDLE)ctrl->handle, &ov, &written, FALSE);
+    }
+    CloseHandle(ov.hEvent);
 
-    if (rc != 0) {
+    if (written != sizeof(pkt)) {
         snprintf(ctrl->error, sizeof(ctrl->error),
-                 "Transfer failed: %s", libusb_strerror(rc));
-        ctrl->connected = false;
+                 "Write failed (error %lu)", GetLastError());
+        ctrl->last_err = XBOX_ERR_SEND;
         return false;
     }
 
-    return transferred > 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Public commands                                                     */
-/* ------------------------------------------------------------------ */
-
-bool xbox_set_led(XboxController *ctrl, uint8_t mode, uint8_t brightness)
-{
-    if (brightness > LED_BRIGHTNESS_MAX)
-        brightness = LED_BRIGHTNESS_MAX;
-    uint8_t payload[] = { 0x00, mode, brightness };
-    return send_gip(ctrl, GIP_CMD_LED, GIP_OPT_INTERNAL, payload, sizeof(payload));
+    return true;
 }
 
 bool xbox_set_brightness(XboxController *ctrl, uint8_t brightness)
@@ -281,16 +169,4 @@ bool xbox_set_brightness(XboxController *ctrl, uint8_t brightness)
 bool xbox_led_off(XboxController *ctrl)
 {
     return xbox_set_led(ctrl, LED_MODE_OFF, 0);
-}
-
-bool xbox_is_usbdk_installed(void)
-{
-#ifdef _WIN32
-    char path[MAX_PATH];
-    GetSystemDirectoryA(path, MAX_PATH);
-    strcat_s(path, MAX_PATH, "\\UsbDkHelper.dll");
-    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
-#else
-    return true;
-#endif
 }
