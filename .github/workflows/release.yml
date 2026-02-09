@@ -29,7 +29,6 @@ jobs:
         run: |
           mkdir release
           copy build\xbledctl.exe release\
-          copy build\libusb-1.0.dll release\
           7z a xbledctl-${{ github.ref_name }}-win64.zip .\release\*
 
       - name: Create Release

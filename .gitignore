@@ -11,9 +11,3 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 imgui.ini
-
-# Installer output
-installer/*.exe
-
-# UsbDk MSI (user downloads separately)
-installer/*.msi
