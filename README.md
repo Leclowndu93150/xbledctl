@@ -6,8 +6,8 @@ This is the first tool to achieve user-mode LED control on Xbox controllers on W
 
 ## Features
 
-- Set LED brightness (0-50)
-- LED modes: solid, blink (fast/normal/slow), fade (fast/slow), off
+- Set LED brightness (0-47%, per [MS-GIPUSB](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gipusb/e7c90904-5e21-426e-b9ad-d82adeee0dbc) spec)
+- LED modes: steady, fast blink, slow blink, charging blink, fade in, off
 - GPU-accelerated GUI (Dear ImGui + DirectX 11)
 - ~400KB executable, no runtime dependencies
 - Works alongside the stock Xbox driver. No Zadig, no driver replacement.
@@ -30,13 +30,13 @@ That's it.
 Xbox controllers use [GIP (Game Input Protocol)](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gipusb/e7c90904-5e21-426e-b9ad-d82adeee0dbc) over USB. The LED is controlled by a 7-byte command:
 
 ```
-Byte 0: 0x0A        Command ID (LED)
-Byte 1: 0x20        Flags (internal)
-Byte 2: <seq>       Sequence number
+Byte 0: 0x0A        Command ID (LED eButton Command)
+Byte 1: 0x20        Flags (single packet, system, no ack)
+Byte 2: <seq>       Sequence number (1-255)
 Byte 3: 0x03        Payload length
-Byte 4: 0x00        Sub-command
-Byte 5: <mode>      LED mode (0x00=off, 0x01=on, 0x02-0x09=animations)
-Byte 6: <brightness> 0-50
+Byte 4: 0x00        Guide Button LED command
+Byte 5: <pattern>   LED pattern (0x00=off, 0x01=on, 0x02=fast blink, 0x03=slow blink, 0x04=charging, 0x0D=ramp)
+Byte 6: <intensity> 0-47
 ```
 
 On Linux, the [xone](https://github.com/medusalix/xone) driver sends this natively. On Windows, the `dc1-controller` / `xboxgip` driver stack provides no user-mode API to send arbitrary GIP commands. Every official API either silently drops the data or is read-only.

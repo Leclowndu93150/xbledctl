@@ -15,14 +15,15 @@ extern "C" {
 #define GIP_CMD_LED        0x0A
 #define GIP_OPT_INTERNAL   0x20
 
-/* LED modes */
-#define LED_MODE_OFF        0x00
-#define LED_MODE_ON         0x01
-#define LED_MODE_BLINK_FAST 0x02
-#define LED_MODE_BLINK      0x03
-#define LED_MODE_BLINK_SLOW 0x04
-#define LED_MODE_FADE_SLOW  0x08
-#define LED_MODE_FADE_FAST  0x09
+/* LED patterns (Table 42, MS-GIPUSB + undocumented) */
+#define LED_MODE_OFF           0x00
+#define LED_MODE_ON            0x01
+#define LED_MODE_BLINK_FAST    0x02
+#define LED_MODE_BLINK_SLOW    0x03
+#define LED_MODE_BLINK_CHARGE  0x04
+#define LED_MODE_FADE_SLOW     0x08
+#define LED_MODE_FADE_FAST     0x09
+#define LED_MODE_RAMP_TO_LEVEL 0x0D
 
 /* Error codes */
 #define XBOX_OK              0
@@ -33,7 +34,7 @@ extern "C" {
 #define XBOX_ERR_LIBUSB      5
 
 #define LED_BRIGHTNESS_MIN     0
-#define LED_BRIGHTNESS_MAX     50
+#define LED_BRIGHTNESS_MAX     47
 #define LED_BRIGHTNESS_DEFAULT 20
 
 typedef struct {

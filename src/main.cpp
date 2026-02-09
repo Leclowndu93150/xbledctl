@@ -81,7 +81,7 @@ static void LoadConfig(int *brightness, int *mode_idx, bool *start_with_windows,
         if (sscanf_s(line, "brightness=%d", &val) == 1)
             *brightness = (val >= 0 && val <= LED_BRIGHTNESS_MAX) ? val : LED_BRIGHTNESS_DEFAULT;
         else if (sscanf_s(line, "mode=%d", &val) == 1)
-            *mode_idx = (val >= 0 && val <= 6) ? val : 1;
+            *mode_idx = (val >= 0 && val <= 7) ? val : 1;
         else if (sscanf_s(line, "start_with_windows=%d", &val) == 1)
             *start_with_windows = (val != 0);
         else if (sscanf_s(line, "minimize_to_tray=%d", &val) == 1)
@@ -194,13 +194,14 @@ struct ModeEntry {
 };
 
 static const ModeEntry MODES[] = {
-    { "Off",        LED_MODE_OFF        },
-    { "Steady",     LED_MODE_ON         },
-    { "Blink Fast", LED_MODE_BLINK_FAST },
-    { "Blink",      LED_MODE_BLINK      },
-    { "Blink Slow", LED_MODE_BLINK_SLOW },
-    { "Fade Slow",  LED_MODE_FADE_SLOW  },
-    { "Fade Fast",  LED_MODE_FADE_FAST  },
+    { "Off",        LED_MODE_OFF           },
+    { "Steady",     LED_MODE_ON            },
+    { "Fast Blink", LED_MODE_BLINK_FAST    },
+    { "Slow Blink", LED_MODE_BLINK_SLOW    },
+    { "Charging",   LED_MODE_BLINK_CHARGE  },
+    { "Fade Slow",  LED_MODE_FADE_SLOW     },
+    { "Fade Fast",  LED_MODE_FADE_FAST     },
+    { "Fade In",    LED_MODE_RAMP_TO_LEVEL },
 };
 static const int MODE_COUNT = sizeof(MODES) / sizeof(MODES[0]);
 
