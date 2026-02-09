@@ -37,13 +37,13 @@ static bool discover_device(XboxController *ctrl)
     memset(&ov, 0, sizeof(ov));
     ov.hEvent = (HANDLE)ctrl->read_event;
 
-    for (int i = 0; i < 20; i++) {
+    for (int i = 0; i < 5; i++) {
         memset(buf, 0, sizeof(buf));
         ResetEvent(ov.hEvent);
         DWORD rd = 0;
         BOOL ok = ReadFile(h, buf, sizeof(buf), &rd, &ov);
         if (!ok && GetLastError() == ERROR_IO_PENDING) {
-            DWORD wait = WaitForSingleObject(ov.hEvent, 500);
+            DWORD wait = WaitForSingleObject(ov.hEvent, 300);
             if (wait == WAIT_TIMEOUT) {
                 CancelIo(h);
                 WaitForSingleObject(ov.hEvent, 100);

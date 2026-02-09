@@ -159,6 +159,14 @@ static DWORD          g_device_change_tick = 0;
 static bool           g_device_removed = false;
 static bool           g_controller_present = false;
 
+enum WorkerCmd { CMD_NONE, CMD_REFRESH, CMD_APPLY };
+static HANDLE         g_worker_thread = nullptr;
+static HANDLE         g_worker_event = nullptr;
+static volatile WorkerCmd g_worker_cmd = CMD_NONE;
+static volatile bool  g_worker_busy = false;
+static volatile int   g_worker_brightness = 0;
+static volatile int   g_worker_mode = 0;
+
 static const ImVec4 COL_WARN    = ImVec4(0.902f, 0.706f, 0.157f, 1.0f);
 
 struct ModeEntry {
@@ -193,62 +201,84 @@ static void SetStatus(const char *msg, const ImVec4 &col)
     g_redraw_frames = 3;
 }
 
+static void PostWorkerCmd(WorkerCmd cmd)
+{
+    if (g_worker_busy)
+        return;
+    if (cmd == CMD_APPLY) {
+        g_worker_brightness = g_brightness;
+        g_worker_mode = g_mode_idx;
+    }
+    g_worker_cmd = cmd;
+    g_worker_busy = true;
+    SetEvent(g_worker_event);
+}
+
+static DWORD WINAPI WorkerThread(LPVOID /*unused*/)
+{
+    while (WaitForSingleObject(g_worker_event, INFINITE) == WAIT_OBJECT_0) {
+        WorkerCmd cmd = g_worker_cmd;
+        g_worker_cmd = CMD_NONE;
+
+        if (cmd == CMD_REFRESH) {
+            xbox_close(&g_ctrl);
+            if (xbox_open(&g_ctrl)) {
+                g_controller_present = true;
+                xbox_close(&g_ctrl);
+                SetStatus("Ready - drag the slider or pick a mode", COL_SUCCESS);
+            } else {
+                g_controller_present = false;
+                SetStatus("Plug in your controller with a USB cable", COL_DIM);
+            }
+        } else if (cmd == CMD_APPLY) {
+            int mode_idx = g_worker_mode;
+            int mode_val = MODES[mode_idx].value;
+            int bright = g_worker_brightness;
+            if (mode_idx == 0) bright = 0;
+
+            if (!xbox_open(&g_ctrl)) {
+                g_controller_present = false;
+                SetStatus("Cannot open controller - try Refresh", COL_ERROR);
+            } else {
+                g_controller_present = true;
+                bool ok = xbox_set_led(&g_ctrl, (uint8_t)mode_val, (uint8_t)bright);
+                xbox_close(&g_ctrl);
+                if (ok) {
+                    if (bright == 0 || mode_idx == 0) {
+                        SetStatus("LED turned off", COL_SUCCESS);
+                    } else {
+                        char buf[128];
+                        snprintf(buf, sizeof(buf), "LED: %s at brightness %d/%d",
+                                 MODES[mode_idx].label, bright, LED_BRIGHTNESS_MAX);
+                        SetStatus(buf, COL_SUCCESS);
+                    }
+                    SaveConfig(bright, mode_idx, g_start_with_windows, g_minimize_to_tray);
+                } else {
+                    SetStatus("Command failed - try Refresh to reconnect", COL_ERROR);
+                }
+            }
+        }
+        g_worker_busy = false;
+    }
+    return 0;
+}
+
 static void ApplyLed()
 {
-    int mode_val = MODES[g_mode_idx].value;
-    int bright   = g_brightness;
-
-    if (g_mode_idx == 0)
-        bright = 0;
-
-    if (!xbox_open(&g_ctrl)) {
-        g_controller_present = false;
-        SetStatus("Cannot open controller - try Refresh", COL_ERROR);
-        return;
-    }
-
-    g_controller_present = true;
-
-    bool ok = xbox_set_led(&g_ctrl, (uint8_t)mode_val, (uint8_t)bright);
-    xbox_close(&g_ctrl);
-
-    if (ok) {
-        if (bright == 0 || g_mode_idx == 0) {
-            SetStatus("LED turned off", COL_SUCCESS);
-        } else {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "LED: %s at brightness %d/%d",
-                     MODES[g_mode_idx].label, bright, LED_BRIGHTNESS_MAX);
-            SetStatus(buf, COL_SUCCESS);
-        }
-        SaveConfig(g_brightness, g_mode_idx, g_start_with_windows, g_minimize_to_tray);
-    } else {
-        SetStatus("Command failed - try Refresh to reconnect", COL_ERROR);
-    }
+    SetStatus("Sending command...", COL_DIM);
+    PostWorkerCmd(CMD_APPLY);
 }
 
 static void RefreshController()
 {
-    xbox_close(&g_ctrl);
-    if (xbox_open(&g_ctrl)) {
-        g_controller_present = true;
-        xbox_close(&g_ctrl);
-        SetStatus("Ready - drag the slider or pick a mode", COL_SUCCESS);
-    } else {
-        g_controller_present = false;
-        SetStatus("Plug in your controller with a USB cable", COL_DIM);
-    }
+    SetStatus("Searching for controller...", COL_DIM);
+    PostWorkerCmd(CMD_REFRESH);
 }
 
 static void TryAutoApply()
 {
-    xbox_close(&g_ctrl);
-    if (xbox_open(&g_ctrl)) {
-        g_controller_present = true;
-        xbox_close(&g_ctrl);
-        SetStatus("Controller connected - applying saved settings", COL_SUCCESS);
-        ApplyLed();
-    }
+    SetStatus("Controller detected - applying settings...", COL_DIM);
+    PostWorkerCmd(CMD_APPLY);
 }
 
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -431,12 +461,15 @@ static void RenderGui(ImFont *fontTitle, ImFont *fontSub, ImFont *fontBig)
 
     ImGui::Spacing();
 
+    bool busy = g_worker_busy;
+    ImGui::BeginDisabled(busy);
+
     ImGui::PushStyleColor(ImGuiCol_Button,       COL_ACCENT);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, COL_ACCENT_H);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  COL_ACCENT_A);
     ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(1,1,1,1));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(24, 12));
-    if (ImGui::Button("Apply"))
+    if (ImGui::Button(busy ? "Applying..." : "Apply"))
         ApplyLed();
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(4);
@@ -451,6 +484,8 @@ static void RenderGui(ImFont *fontTitle, ImFont *fontSub, ImFont *fontBig)
         RefreshController();
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(3);
+
+    ImGui::EndDisabled();
 
     ImGui::Spacing();
     ImGui::TextColored(g_status_color, "%s", g_status);
@@ -521,10 +556,21 @@ static void CleanupRenderTarget()
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 {
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Global\\xbledctl_single_instance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowW(L"xbledctl", nullptr);
+        if (existing) {
+            PostMessageW(existing, WM_COMMAND, ID_TRAY_SHOW, 0);
+        }
+        return 0;
+    }
+
     bool start_minimized = (strstr(lpCmdLine, "--minimized") != nullptr);
 
     xbox_init(&g_ctrl);
     g_status_color = COL_DIM;
+    g_worker_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    g_worker_thread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
 
     InitConfigPath();
     LoadConfig(&g_brightness, &g_mode_idx, &g_start_with_windows, &g_minimize_to_tray);
@@ -662,6 +708,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         g_redraw_frames--;
     }
 
+    TerminateThread(g_worker_thread, 0);
+    CloseHandle(g_worker_thread);
+    CloseHandle(g_worker_event);
     xbox_cleanup(&g_ctrl);
 
     ImGui_ImplDX11_Shutdown();
@@ -670,6 +719,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     CleanupDeviceD3D();
     DestroyWindow(g_hwnd);
     UnregisterClassW(wc.lpszClassName, hInstance);
+    ReleaseMutex(hMutex);
+    CloseHandle(hMutex);
 
     return 0;
 }
