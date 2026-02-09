@@ -7,7 +7,7 @@ This is the first tool to achieve user-mode LED control on Xbox controllers on W
 ## Features
 
 - Set LED brightness (0-47%, per [MS-GIPUSB](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gipusb/e7c90904-5e21-426e-b9ad-d82adeee0dbc) spec)
-- LED modes: steady, fast blink, slow blink, charging blink, fade in, off
+- LED modes: steady, fast blink, slow blink, charging blink, fade (slow/fast), fade in, off
 - GPU-accelerated GUI (Dear ImGui + DirectX 11)
 - ~400KB executable, no runtime dependencies
 - Works alongside the stock Xbox driver. No Zadig, no driver replacement.
