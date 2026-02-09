@@ -8,9 +8,7 @@ This is the first tool to achieve user-mode LED control on Xbox controllers on W
 
 - Set LED brightness (0-50)
 - LED modes: solid, blink (fast/normal/slow), fade (fast/slow), off
-- GPU-accelerated GUI (Dear ImGui + DirectX 11)
-- ~400KB executable, no runtime dependencies
-- Works alongside the stock Xbox driver. No Zadig, no driver replacement.
+- Works alongside the stock Xbox driver.
 - Supports Xbox One, One S, One Elite, Elite Series 2, Series X|S, Adaptive Controller
 - Auto-applies saved settings when the controller is plugged in
 - Starts with Windows and minimizes to system tray (configurable)
